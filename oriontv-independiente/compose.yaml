@@ -1,0 +1,13 @@
+services:
+  oriontv:
+    build: ./server
+    restart: unless-stopped
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL:?Configura PUBLIC_URL en .env}
+      ORION_DATA: /data
+    ports:
+      - "127.0.0.1:8099:8099"
+    volumes:
+      - oriontv_data:/data
+volumes:
+  oriontv_data:

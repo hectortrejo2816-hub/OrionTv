@@ -1,0 +1,25 @@
+plugins { id 'com.android.application' }
+android {
+ namespace 'com.oriontv.independent'
+ compileSdk 35
+ defaultConfig {
+  applicationId 'com.oriontv.independent'
+  minSdk 23
+  targetSdk 35
+  def apiUrl = (project.findProperty("orionApiUrl") ?: "").toString()
+  buildConfigField "String", "ACTIVATION_BASE_URL", "\"" + apiUrl.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+  def fallbackUrls = (project.findProperty("orionApiFallbackUrls") ?: "").toString()
+  buildConfigField "String", "ACTIVATION_FALLBACK_URLS", "\"" + fallbackUrls.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+  versionCode 7
+  versionName '1.6.0-respaldo-conexion-pruebas'
+ }
+ buildFeatures { buildConfig true }
+ compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+ buildTypes { release { minifyEnabled false } }
+}
+dependencies {
+ implementation 'androidx.media3:media3-exoplayer:1.5.1'
+ implementation 'androidx.media3:media3-exoplayer-hls:1.5.1'
+ implementation 'androidx.media3:media3-exoplayer-dash:1.5.1'
+ implementation 'androidx.media3:media3-ui:1.5.1'
+}
