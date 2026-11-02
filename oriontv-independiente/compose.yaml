@@ -5,9 +5,20 @@ services:
     environment:
       PUBLIC_URL: ${PUBLIC_URL:?Configura PUBLIC_URL en .env}
       ORION_DATA: /data
+      MATEO_WA_ENABLED: "${MATEO_WA_ENABLED:-0}"
+      MATEO_WA_APP_SECRET: "${MATEO_WA_APP_SECRET:-}"
+      MATEO_WA_VERIFY_TOKEN: "${MATEO_WA_VERIFY_TOKEN:-}"
+      MATEO_WA_ACCESS_TOKEN: "${MATEO_WA_ACCESS_TOKEN:-}"
+      MATEO_WA_PHONE_NUMBER_ID: "${MATEO_WA_PHONE_NUMBER_ID:-}"
+      MATEO_WA_GRAPH_VERSION: "${MATEO_WA_GRAPH_VERSION:-}"
+      MATEO_WA_OWNER_NUMBER: "${MATEO_WA_OWNER_NUMBER:-}"
+      MATEO_WA_ADMIN: "${MATEO_WA_ADMIN:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ORION_ASSISTANT_MODEL: "${ORION_ASSISTANT_MODEL:-}"
     ports:
       - "127.0.0.1:8099:8099"
     volumes:
       - oriontv_data:/data
+
 volumes:
   oriontv_data:
