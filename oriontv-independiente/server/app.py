@@ -278,3 +278,6 @@ def health():return {'status':'ok','application':'oriontv-independent'}
 @app.get('/')
 def index():return FileResponse(Path(__file__).parent/'static/index.html')
 app.mount('/static',StaticFiles(directory=Path(__file__).parent/'static'),name='static')
+# Agente MATEO por WhatsApp
+from mateo_whatsapp import install as install_mateo_whatsapp
+install_mateo_whatsapp(globals())
