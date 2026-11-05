@@ -1,12 +1,12 @@
 {
   "enabled": true,
   "package_name": "com.oriontv.independent",
-  "version_code": 59,
-  "version_name": "2.9.9-orion-management",
+  "version_code": 61,
+  "version_name": "2.11.0-orion-management",
   "min_sdk": 23,
-  "size_bytes": 245262334,
-  "sha256": "906bc2853b50566eb70b8521c998e820f291f21e7b22ea60d71b673739cad404",
+  "size_bytes": 143098447,
+  "sha256": "1559eb9e574c8db04d33185a967124a4c35d8f4999b720514f1ffdefd6876257",
   "signer_sha256": "6b21b1367446136a9c93e2e738521dca2aad0c1bb1d87c84578c46900afbb4c1",
-  "apk_url": "https://panel.oriontv.tech/descargas/OrionTv-Premium-v59.apk",
-  "notes": "Actualización de OrionTV Premium a la versión 59."
+  "apk_url": "https://panel.oriontv.tech/descargas/OrionTv-Premium-v61.apk",
+  "notes": "Mejoras en la carga de películas y series y reducción del tamaño de la aplicación."
 }
