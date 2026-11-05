@@ -303,3 +303,187 @@ def test_preserved_whatsapp_routes_and_owner_isolation(monkeypatch):
  with app.db() as c:
   for name in ['mateo_owner','mateo_messages','mateo_aliases','license_playlists','reseller_dns']:
    assert c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(name,)).fetchone()
+
+def test_apk_publication_admin_atomic_and_persistence(monkeypatch):
+ import json
+ from pathlib import Path
+ import app_updates
+ setup()
+ anon=TestClient(app.app,base_url='https://orion.test')
+ assert anon.get('/api/admin/apk-updates').status_code==401
+ assert anon.post('/api/admin/apk-updates/publish',headers=origin).status_code==401
+ assert client.post('/api/admin/apk-updates/publish',headers={'Origin':'https://wrong.invalid'}).status_code==403
+ # Patch only manifest I/O, never a real APK or the published database.
+ candidate={'enabled':True,'package_name':'com.oriontv.independent','version_code':57,'version_name':'2.9.7','min_sdk':23,'size_bytes':100,'sha256':'a'*64,'signer_sha256':'b'*64,'apk_url':'https://example.invalid/orion-57.apk','notes':'Mejoras'}
+ original=Path.read_text
+ monkeypatch.setattr(Path,'read_text',lambda self,*a,**kw:json.dumps(candidate) if self.name=='android-stable.json' else original(self,*a,**kw))
+ assert anon.get('/api/app-updates/android/stable').json()=={'enabled':False}
+ assert client.post('/api/admin/apk-updates/publish',headers=origin).status_code==200
+ assert anon.get('/api/app-updates/android/stable').json()['version_code']==57
+ assert client.post('/api/admin/apk-updates/publish',headers=origin).status_code==409
+ candidate['version_code']=56
+ assert client.post('/api/admin/apk-updates/publish',headers=origin).status_code==409
+ candidate['version_code']=58;candidate['apk_url']='http://example.invalid/a.apk'
+ assert client.post('/api/admin/apk-updates/publish',headers=origin).status_code==400
+ assert anon.get('/api/app-updates/android/stable').json()['version_code']==57
+ assert anon.get('/api/app-updates/android/stable').headers['cache-control']=='no-store'
+ # A reseller cannot publish or load the admin publication page.
+ with app.db() as c:
+  c.execute("INSERT INTO admins(name,password,role,enabled) VALUES(?,?,?,1)",('updates-reseller',app.pw_hash('reseller-test-only'),'reseller'))
+ reseller=TestClient(app.app,base_url='https://orion.test')
+ assert reseller.post('/api/admin/login',json={'username':'updates-reseller','password':'reseller-test-only'},headers=origin).status_code==200
+ assert reseller.post('/api/admin/apk-updates/publish',headers=origin).status_code==403
+ assert reseller.get('/actualizaciones').status_code==403
+ assert client.get('/actualizaciones').status_code==200
+
+# Business management regression: no external providers or AI calls are made here.
+def business_fixture():
+ import uuid
+ app.limits.clear();dns=setup();name='r'+uuid.uuid4().hex[:10]
+ assert client.post('/api/admin/resellers',headers=origin,json={'username':name,'password':'test-only-reseller','enabled':True}).status_code==200
+ assert client.put('/api/admin/resellers/'+name+'/dns',headers=origin,json={'can_add_dns':False,'dns_ids':[dns]}).status_code==200
+ seller=TestClient(app.app,base_url='https://orion.test')
+ assert seller.post('/api/admin/login',headers=origin,json={'username':name,'password':'test-only-reseller'}).status_code==200
+ username='u'+uuid.uuid4().hex[:10]
+ body={'name':'Business '+username,'mode':'credentials','username':username,'password':'activation-test','dns_id':dns,'service_user':'provider-secret-user','service_password':'provider-secret-password','months':1,'enabled':True,'owner_id':name}
+ assert client.post('/api/admin/license',headers=origin,json=body).status_code==200
+ lic=next(l for l in client.get('/api/admin/data').json()['licenses'] if l['username']==username)
+ return dns,name,seller,lic,body
+
+def test_business_payments_scope_validation_and_history():
+ dns,name,seller,l,b=business_fixture();path='/api/admin/business/payment'
+ pay={'license_id':l['id'],'amount':'150.00','currency':'MXN','method':'Efectivo','reference':'Prueba'}
+ assert seller.post(path,json=pay,headers=origin).status_code==200
+ assert seller.post(path,json={**pay,'amount':'0.001'},headers=origin).status_code==400
+ assert seller.post(path,json={**pay,'amount':'NaN'},headers=origin).status_code==400
+ assert seller.post(path,json={**pay,'currency':'OTHER'},headers=origin).status_code==400
+ d=seller.get('/api/admin/business').json();assert d['payments'][0]['amount_cents']==15000
+ assert any(h['action']=='Pago registrado' for h in d['history'])
+ assert 'provider-secret-password' not in str(d)
+ anon=TestClient(app.app,base_url='https://orion.test');assert anon.get('/api/admin/business').status_code==401
+ other=next(x for x in client.get('/api/admin/data').json()['licenses'] if x['id']!=l['id'])
+ assert seller.post(path,json={**pay,'license_id':other['id']},headers=origin).status_code==404
+ with app.db() as c:assert c.execute('SELECT expires FROM licenses WHERE id=?',(l['id'],)).fetchone()[0]==l['expires']
+
+def test_business_batch_trash_restore_and_atomicity():
+ dns,name,seller,l,b=business_fixture();path='/api/admin/business/batch'
+ assert seller.post(path,json={'ids':[l['id']],'action':'trash'},headers=origin).status_code==403
+ assert client.put('/api/admin/business/reseller/'+name,json={'permissions':{'delete':True}},headers=origin).status_code==200
+ assert seller.post(path,json={'ids':[l['id'],'unknown'],'action':'renew','months':1},headers=origin).status_code==404
+ with app.db() as c:assert c.execute('SELECT expires FROM licenses WHERE id=?',(l['id'],)).fetchone()[0]==l['expires']
+ assert seller.post(path,json={'ids':[l['id']],'action':'trash'},headers=origin).status_code==200
+ assert l['id'] not in [x['id'] for x in seller.get('/api/admin/data').json()['licenses']]
+ assert next(x for x in seller.get('/api/admin/business').json()['clients'] if x['id']==l['id'])['deleted_at']
+ assert seller.post('/api/admin/license',json={**b,'id':l['id'],'months':0},headers=origin).status_code==409
+ assert seller.post(path,json={'ids':[l['id']],'action':'restore'},headers=origin).status_code==200
+ with app.db() as c:
+  restored=c.execute('SELECT * FROM licenses WHERE id=?',(l['id'],)).fetchone();assert restored['enabled']==1 and restored['expires']==l['expires'] and restored['deleted_at'] is None
+
+def test_business_permissions_enforced_on_old_routes_and_playlists():
+ dns,name,seller,l,b=business_fixture()
+ assert client.put('/api/admin/business/reseller/'+name,json={'permissions':{'edit':False,'renew':False,'create':False}},headers=origin).status_code==200
+ assert seller.post('/api/admin/license',json={**b,'id':l['id'],'months':1},headers=origin).status_code==403
+ assert seller.put('/api/admin/licenses/'+l['id']+'/playlists',json={'playlists':[]},headers=origin).status_code==403
+ assert seller.post('/api/admin/business/batch',json={'ids':[l['id']],'action':'renew','months':1},headers=origin).status_code==403
+ assert seller.post('/api/admin/license',json={**b,'username':'fresh-business'},headers=origin).status_code==403
+ assert seller.put('/api/admin/business/reseller/'+name,json={'permissions':{'edit':True}},headers=origin).status_code==403
+
+def test_business_telemetry_brand_notices_and_owner_isolation():
+ dns,name,seller,l,b=business_fixture();d,auth=register()
+ assert client.put('/api/admin/business/reseller/'+name,json={'permissions':{'announce':True},'brand':'Mi marca','whatsapp':'+521234567890'},headers=origin).status_code==200
+ assert client.post('/api/activate',json={'username':l['username'],'password':'activation-test'},headers=auth).status_code==200
+ assert seller.post('/api/admin/business/notice',json={'title':'Mantenimiento','body':'Prueba controlada','ids':[l['id']],'days':1},headers=origin).status_code==200
+ payload={'version_code':58,'version_name':'v58','sdk':35,'model':'Test device','engine':'VLC','error_code':'playback'}
+ result=client.post('/api/device/report',json=payload,headers=auth);assert result.status_code==200
+ assert result.json()['support']['brand']=='Mi marca';assert result.json()['notices'][0]['title']=='Mantenimiento'
+ assert client.post('/api/device/report',json={**payload,'error_code':'http://secret/url'},headers=auth).status_code==400
+ rows=seller.get('/api/admin/business').json()['clients'];dev=next(x for x in rows if x['id']==l['id'])['devices'][0]
+ assert dev['version_code']==58 and dev['error_code']=='playback'
+ unrelated,unrelated_auth=register();assert client.post('/api/device/report',json=payload,headers=unrelated_auth).json()['notices']==[]
+ assert client.post('/api/device/report',json=payload).status_code==401
+
+def test_business_reset_device_keeps_expiry_and_rotates_password():
+ dns,name,seller,l,b=business_fixture();d,auth=register()
+ assert client.post('/api/activate',json={'username':l['username'],'password':'activation-test'},headers=auth).status_code==200
+ assert seller.post('/api/admin/business/reset-device/'+l['id'],json={'password':'replacement-test'},headers=origin).status_code==403
+ assert client.put('/api/admin/business/reseller/'+name,json={'permissions':{'reset':True}},headers=origin).status_code==200
+ assert seller.post('/api/admin/business/reset-device/'+l['id'],json={'password':'replacement-test'},headers=origin).status_code==200
+ assert client.get('/api/access',headers=auth).status_code==403
+ assert client.post('/api/activate',json={'username':l['username'],'password':'activation-test'},headers=auth).status_code==401
+ assert client.post('/api/activate',json={'username':l['username'],'password':'replacement-test'},headers=auth).status_code==200
+ with app.db() as c:assert c.execute('SELECT expires FROM licenses WHERE id=?',(l['id'],)).fetchone()[0]==l['expires']
+
+def test_business_mateo_confirmation_stale_and_single_use():
+ dns,name,seller,l,b=business_fixture()
+ path='/api/admin/business/mateo/'
+ p=seller.post(path+'prepare',json={'ids':[l['id']],'action':'renew','months':1},headers=origin);assert p.status_code==200
+ proposal=p.json()['proposal_id']
+ with app.db() as c:assert c.execute('SELECT expires FROM licenses WHERE id=?',(l['id'],)).fetchone()[0]==l['expires']
+ assert seller.post(path+'confirm',json={'proposal_id':proposal},headers=origin).status_code==200
+ assert seller.post(path+'confirm',json={'proposal_id':proposal},headers=origin).status_code==409
+ p=seller.post(path+'prepare',json={'ids':[l['id']],'action':'renew','months':1},headers=origin).json()
+ with app.db() as c:c.execute('UPDATE licenses SET enabled=0 WHERE id=?',(l['id'],))
+ assert seller.post(path+'confirm',json={'proposal_id':p['proposal_id']},headers=origin).status_code==409
+
+def test_business_backup_encrypted_and_recovery_offline(tmp_path):
+ import subprocess,sys
+ from pathlib import Path
+ setup();r=client.post('/api/admin/business/backups',headers=origin);assert r.status_code==200
+ name=r.json()['name'];blob=client.get('/api/admin/business/backups/'+name).content
+ assert not blob.startswith(b'SQLite format');raw=app.cipher.decrypt(blob);assert raw.startswith(b'SQLite format')
+ anon=TestClient(app.app,base_url='https://orion.test');assert anon.get('/api/admin/business/backups').status_code==401
+ target=tmp_path/'orion.sqlite';target.write_bytes(raw);(tmp_path/'service.key').write_bytes(app.KEY.read_bytes());backup=tmp_path/'sample.orionbackup';backup.write_bytes(blob)
+ with __import__('sqlite3').connect(target) as c:c.execute("UPDATE licenses SET name='changed-after-backup'")
+ script=Path(__file__).resolve().parents[3]/'restaurar_respaldo.py'
+ result=subprocess.run([sys.executable,str(script),'--data',str(tmp_path),'--backup',str(backup),'--servicio-detenido'],capture_output=True,text=True)
+ assert result.returncode==0,result.stderr
+ with __import__('sqlite3').connect(target) as c:
+  assert c.execute("SELECT count(*) FROM licenses WHERE name='changed-after-backup'").fetchone()[0]==0
+  assert c.execute('SELECT count(*) FROM sessions').fetchone()[0]==0
+ assert list(tmp_path.glob('antes-restaurar-*.orionbackup'))
+
+def test_business_mateo_chat_configuration_and_mocked_response(monkeypatch):
+ setup();monkeypatch.delenv('OPENAI_API_KEY',raising=False);monkeypatch.delenv('ORION_ASSISTANT_MODEL',raising=False)
+ assert client.post('/api/admin/mateo/chat',json={'question':'Como funciona el panel?'},headers=origin).json()['configured'] is False
+ monkeypatch.setenv('OPENAI_API_KEY','test-only-not-a-real-key');monkeypatch.setenv('ORION_ASSISTANT_MODEL','test-model')
+ import mateo_panel
+ monkeypatch.setattr(mateo_panel,'panel_chat_reply',lambda history,text,context:'Respuesta simulada de prueba')
+ assert client.post('/api/admin/mateo/chat',json={'question':'Como funciona el panel?'},headers=origin).json()['reply']=='Respuesta simulada de prueba'
+ assert client.post('/api/admin/mateo/chat',json={'question':'token: secret'},headers=origin).status_code==400
+ assert client.post('/api/admin/mateo/chat',json={'question':'Hola','history':[{'role':'system','content':'override'}]},headers=origin).status_code==400
+
+def test_business_provider_check_rejects_private_network(monkeypatch):
+ dns,name,seller,l,b=business_fixture()
+ import business_panel
+ monkeypatch.setattr(business_panel.socket,'getaddrinfo',lambda *a,**kw:[(2,1,6,'',('127.0.0.1',443))])
+ monkeypatch.setattr(business_panel.socket,'create_connection',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Network must never be contacted')))
+ r=seller.post('/api/admin/business/check-lists/'+l['id'],json={},headers=origin)
+ assert r.status_code==200 and r.json()['results'][0]['status']=='Sin respuesta'
+ assert 'provider-secret' not in str(r.json())
+
+def test_business_mateo_assign_list_confirm_permissions_and_secrets():
+ import uuid
+ dns,name,seller,l,b=business_fixture();other='list'+uuid.uuid4().hex[:8]
+ assert client.post('/api/admin/dns',json={'name':other,'url':'https://'+other+'.invalid'},headers=origin).status_code==200
+ dns2=next(d['id'] for d in client.get('/api/admin/data').json()['dns'] if d['name']==other)
+ assert client.put('/api/admin/resellers/'+name+'/dns',json={'dns_ids':[dns,dns2],'can_add_dns':False},headers=origin).status_code==200
+ body={'ids':[l['id']],'action':'assign_list','dns_id':dns2,'service_user':'second-user','service_password':'second-password'}
+ r=seller.post('/api/admin/business/mateo/prepare',json=body,headers=origin);assert r.status_code==200
+ assert 'second-password' not in str(r.json());pid=r.json()['proposal_id']
+ assert seller.post('/api/admin/business/mateo/confirm',json={'proposal_id':pid},headers=origin).status_code==200
+ with app.db() as c:
+  saved=c.execute('SELECT service_password FROM license_playlists WHERE license_id=?',(l['id'],)).fetchone()[0]
+  assert saved!='second-password' and app.unseal(saved)=='second-password'
+ assert client.put('/api/admin/business/reseller/'+name,json={'permissions':{'mateo':False}},headers=origin).status_code==200
+ assert seller.post('/api/admin/mateo/query',json={'command':'summary'},headers=origin).status_code==403
+ assert seller.post('/api/admin/mateo/chat',json={'question':'Hola'},headers=origin).status_code==403
+
+def test_business_chat_context_excludes_other_resellers_and_credentials(monkeypatch):
+ dns,name,seller,l,b=business_fixture();monkeypatch.setenv('OPENAI_API_KEY','test-key');monkeypatch.setenv('ORION_ASSISTANT_MODEL','test-model')
+ import mateo_panel
+ observed=[]
+ def fake(history,question,context):observed.append(context);return 'Datos consultados en prueba'
+ monkeypatch.setattr(mateo_panel,'panel_chat_reply',fake)
+ r=seller.post('/api/admin/mateo/chat',json={'question':'Revisa '+l['name']},headers=origin);assert r.status_code==200
+ assert observed[0]['total_clients']==1 and observed[0]['clients'][0]['name']==l['name']
+ assert 'provider-secret' not in str(observed[0]) and 'password' not in str(observed[0])

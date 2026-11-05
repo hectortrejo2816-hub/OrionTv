@@ -98,8 +98,8 @@ def operator(req:Request):
 def admin(req:Request):
  actor=operator(req);check(actor['role']=='admin','Solo el administrador puede realizar esta acción',403);return actor
 def own_license(actor,id):
- with db() as c:r=c.execute('SELECT owner_id FROM licenses WHERE id=?',(id,)).fetchone()
- check(r,'Cliente no encontrado',404);check(actor['role']=='admin' or r['owner_id']==actor['name'],'Acceso no permitido',403)
+ with db() as c:r=c.execute('SELECT owner_id,deleted_at FROM licenses WHERE id=?',(id,)).fetchone()
+ check(r,'Cliente no encontrado',404);check(actor['role']=='admin' or r['owner_id']==actor['name'],'Acceso no permitido',403);check(r['deleted_at'] is None,'Este cliente está en la papelera',409)
 def device(req:Request):
  token=req.headers.get('authorization','').removeprefix('Bearer ')
  check(len(token)>20,'Dispositivo no registrado',401)
@@ -121,7 +121,7 @@ async def logout(req:Request):
 def data(actor=Depends(operator)):
  with db() as c:
   dns=[dict(x) for x in c.execute('SELECT * FROM dns ORDER BY is_default DESC,name')]
-  licenses=[dict(x) for x in c.execute('SELECT id,name,mode,mac,username,device_id,device_limit,owner_id,dns_id,service_user,expires,enabled,notes FROM licenses ORDER BY expires DESC')]
+  licenses=[dict(x) for x in c.execute('SELECT id,name,mode,mac,username,device_id,device_limit,owner_id,dns_id,service_user,expires,enabled,notes FROM licenses WHERE deleted_at IS NULL ORDER BY expires DESC')]
   devices=[dict(x) for x in c.execute('SELECT id,mac,demo_started,demo_expires,demo_used,created FROM devices ORDER BY created DESC')]
   config=dict(c.execute('SELECT * FROM config WHERE id=1').fetchone());config['has_password']=bool(config.pop('service_password'))
   resellers=[dict(x) for x in c.execute("SELECT name,display_name,enabled,can_add_dns FROM admins WHERE role='reseller' ORDER BY name")] if actor['role']=='admin' else []
@@ -345,3 +345,10 @@ install_mateo_panel(globals())
 # Agente MATEO por WhatsApp (conservado del repositorio actual)
 from mateo_whatsapp import install as install_mateo_whatsapp
 install_mateo_whatsapp(globals())
+
+# APK update feed: disabled until a verified signed release is published.
+from app_updates import install_app_updates
+install_app_updates(globals())
+
+from business_panel import install_business
+install_business(globals())
