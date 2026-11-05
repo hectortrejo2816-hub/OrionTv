@@ -45,6 +45,21 @@ with db() as c:
 with db() as c:
  for table,column,decl in [('admins','role',"TEXT NOT NULL DEFAULT 'admin'"),('admins','enabled','INTEGER NOT NULL DEFAULT 1'),('admins','display_name',"TEXT NOT NULL DEFAULT ''"),('sessions','username','TEXT'),('dns','alternatives',"TEXT NOT NULL DEFAULT '[]'"),('licenses','owner_id','TEXT')]:
   if column not in {r['name'] for r in c.execute('PRAGMA table_info('+table+')')}:c.execute('ALTER TABLE '+table+' ADD COLUMN '+column+' '+decl)
+# Per-reseller DNS permissions, additive and disabled by default.
+with db() as c:
+ for table,column,decl in [('admins','can_add_dns','INTEGER NOT NULL DEFAULT 0'),('dns','owner_id','TEXT')]:
+  if column not in {r['name'] for r in c.execute('PRAGMA table_info('+table+')')}:
+   c.execute('ALTER TABLE '+table+' ADD COLUMN '+column+' '+decl)
+ c.execute('CREATE TABLE IF NOT EXISTS reseller_dns (reseller TEXT NOT NULL REFERENCES admins(name),dns_id TEXT NOT NULL REFERENCES dns(id),PRIMARY KEY(reseller,dns_id))')
+def allowed_dns(c, actor, dns_id):
+ return actor['role']=='admin' or bool(c.execute('SELECT 1 FROM dns WHERE id=? AND (owner_id=? OR EXISTS (SELECT 1 FROM reseller_dns r WHERE r.dns_id=dns.id AND r.reseller=?))',(dns_id,actor['name'],actor['name'])).fetchone())
+# Appearance is independent of licenses and survives container rebuilds in /data.
+with db() as c:
+ c.execute("CREATE TABLE IF NOT EXISTS app_appearance (id INTEGER PRIMARY KEY CHECK(id=1),theme TEXT NOT NULL DEFAULT 'orion',revision INTEGER NOT NULL DEFAULT 1)")
+ c.execute('INSERT OR IGNORE INTO app_appearance(id) VALUES(1)')
+def app_appearance(c):
+ row=c.execute('SELECT theme,revision FROM app_appearance WHERE id=1').fetchone()
+ return dict(row)
 def digest(s):return hashlib.sha256(s.encode()).hexdigest()
 def pw_hash(s):
  salt=secrets.token_bytes(16);return salt.hex()+':'+hashlib.pbkdf2_hmac('sha256',s.encode(),salt,310000).hex()
@@ -109,13 +124,21 @@ def data(actor=Depends(operator)):
   licenses=[dict(x) for x in c.execute('SELECT id,name,mode,mac,username,device_id,device_limit,owner_id,dns_id,service_user,expires,enabled,notes FROM licenses ORDER BY expires DESC')]
   devices=[dict(x) for x in c.execute('SELECT id,mac,demo_started,demo_expires,demo_used,created FROM devices ORDER BY created DESC')]
   config=dict(c.execute('SELECT * FROM config WHERE id=1').fetchone());config['has_password']=bool(config.pop('service_password'))
-  resellers=[dict(x) for x in c.execute("SELECT name,display_name,enabled FROM admins WHERE role='reseller' ORDER BY name")] if actor['role']=='admin' else []
+  resellers=[dict(x) for x in c.execute("SELECT name,display_name,enabled,can_add_dns FROM admins WHERE role='reseller' ORDER BY name")] if actor['role']=='admin' else []
   if actor['role']!='admin':
+   dns=[{'id':d['id'],'name':d['name'],'is_default':0,'owned':d.get('owner_id')==actor['name']} for d in dns if allowed_dns(c,actor,d['id'])]
    licenses=[l for l in licenses if l['owner_id']==actor['name']]
    allowed={l['device_id'] for l in licenses};codes={l['mac'] for l in licenses}
    allowed.update(r[0] for r in c.execute('SELECT ld.device_id FROM license_devices ld JOIN licenses l ON l.id=ld.license_id WHERE l.owner_id=?',(actor['name'],)))
    devices=[d for d in devices if d['id'] in allowed or d['mac'] in codes];config={}
-  return {'dns':dns,'licenses':licenses,'devices':devices,'demo':config,'resellers':resellers,'role':actor['role'],'actor':actor['name'],'server_time':int(time.time())}
+  return {'dns':dns,'licenses':licenses,'devices':devices,'demo':config,'resellers':resellers,'role':actor['role'],'actor':actor['name'],'can_add_dns':bool(actor.get('can_add_dns',0)),'app_theme':app_appearance(c),'server_time':int(time.time())}
+@app.post('/api/admin/app-theme',dependencies=[Depends(admin)])
+async def save_app_theme(req:Request):
+ b=await req.json();theme=b.get('theme')
+ check(isinstance(theme,str) and theme in ('orion','ibo','midnight'),'Selecciona un tema válido')
+ with db() as c:
+  c.execute('UPDATE app_appearance SET revision=revision+CASE WHEN theme<>? THEN 1 ELSE 0 END,theme=? WHERE id=1',(theme,theme))
+  return app_appearance(c)
 @app.post('/api/admin/resellers',dependencies=[Depends(admin)])
 async def save_reseller(req:Request):
  b=await req.json();name=text(b,'username',64).lower();display=text(b,'display_name',100);password=text(b,'password',128)
@@ -128,8 +151,9 @@ async def save_reseller(req:Request):
   c.execute("INSERT INTO admins(name,password,role,enabled,display_name) VALUES (?,?,'reseller',?,?) ON CONFLICT(name) DO UPDATE SET password=excluded.password,enabled=excluded.enabled,display_name=excluded.display_name",(name,hashed,int(b.get('enabled',True)),display))
   c.execute('DELETE FROM sessions WHERE username=?',(name,))
  return {'ok':True}
-@app.post('/api/admin/dns',dependencies=[Depends(admin)])
-async def save_dns(req:Request):
+@app.post('/api/admin/dns')
+async def save_dns(req:Request,actor=Depends(operator)):
+ check(actor['role']=='admin' or actor.get('can_add_dns'),'No tienes permiso para agregar DNS',403)
  b=await req.json();name=text(b,'name',100);url=text(b,'url',2048).rstrip('/');parsed=urlparse(url);check(name and parsed.scheme in ('http','https') and parsed.hostname and not parsed.username and not parsed.password,'Nombre o URL inválidos')
  alternatives=b.get('alternatives',[]);check(isinstance(alternatives,list) and len(alternatives)<=3,'Agrega hasta 3 direcciones alternativas')
  cleaned=[]
@@ -142,9 +166,13 @@ async def save_dns(req:Request):
   if value!=url and value not in cleaned:cleaned.append(value)
  with db() as c:
   i=text(b,'id',100) or secrets.token_hex(16)
+  existing=c.execute('SELECT owner_id FROM dns WHERE id=?',(i,)).fetchone()
+  check(actor['role']=='admin' or (actor.get('can_add_dns') and (not existing or existing['owner_id']==actor['name'])), 'No tienes permiso para agregar o modificar este DNS',403)
+  check(actor['role']=='admin' or not b.get('is_default'),'Solo el administrador configura el DNS predeterminado',403)
   if b.get('is_default'):c.execute('UPDATE dns SET is_default=0')
   try:c.execute('INSERT INTO dns(id,name,url,is_default,alternatives) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,url=excluded.url,is_default=excluded.is_default,alternatives=excluded.alternatives',(i,name,url,int(bool(b.get('is_default'))),json.dumps(cleaned)))
-  except sqlite3.IntegrityError:raise HTTPException(409,'Este DNS ya está guardado')
+  except sqlite3.IntegrityError:raise HTTPException(409,'No se pudo guardar este DNS; consulta al administrador')
+  if actor['role']!='admin' and not existing:c.execute('UPDATE dns SET owner_id=? WHERE id=?',(actor['name'],i))
  return {'ok':True}
 @app.post('/api/admin/demo',dependencies=[Depends(admin)])
 async def save_demo(req:Request):
@@ -168,6 +196,11 @@ async def save_license(req:Request,actor=Depends(operator)):
   owner=(text(b,'owner_id',64) or None) if actor['role']=='admin' else actor['name']
   if owner:check(c.execute("SELECT name FROM admins WHERE name=? AND role='reseller'",(owner,)).fetchone(),'Revendedor no encontrado')
   check(not i or old,'Registro no encontrado',404);check(c.execute('SELECT id FROM dns WHERE id=?',(dns,)).fetchone(),'Selecciona un DNS guardado')
+  check(allowed_dns(c,actor,dns),'Lista no autorizada para este revendedor',403)
+  if owner:
+   check(allowed_dns(c,{'role':'reseller','name':owner},dns),'Autoriza primero esta lista al revendedor',403)
+   if old and old['owner_id']!=owner:
+    check(all(allowed_dns(c,{'role':'reseller','name':owner},r[0]) for r in c.execute('SELECT dns_id FROM license_playlists WHERE license_id=?',(i,))),'Las listas adicionales no están autorizadas al nuevo revendedor',403)
   service_password=seal(sp) if sp else (old['service_password'] if old else '')
   check(service_password,'Agrega la contraseña del servicio')
   password=pw_hash(p) if p else (old['password'] if old else None)
@@ -238,10 +271,10 @@ def access(d):
   license=c.execute('SELECT l.*,n.url,n.alternatives FROM licenses l JOIN dns n ON n.id=l.dns_id WHERE l.mac=? OR l.device_id=? OR EXISTS (SELECT 1 FROM license_devices ld WHERE ld.license_id=l.id AND ld.device_id=?) ORDER BY l.expires DESC LIMIT 1',(d['mac'],d['id'],d['id'])).fetchone()
   if license:
    check(license['enabled'] and license['expires']>now,'Tu activación venció o está suspendida.',403)
-   return {'status':'active','expires_at':license['expires'],'server_time':now,'dns':license['url'],'dns_alternatives':json.loads(license['alternatives']),'username':license['service_user'],'password':unseal(license['service_password']),'channel_policy':json.loads(license['channel_policy'])}
+   return {'app_theme':app_appearance(c),'status':'active','expires_at':license['expires'],'server_time':now,'dns':license['url'],'dns_alternatives':json.loads(license['alternatives']),'username':license['service_user'],'password':unseal(license['service_password']),'channel_policy':json.loads(license['channel_policy'])}
   check(d['demo_expires'] and d['demo_expires']>now,'Tu prueba terminó. Contacta a tu distribuidor.' if d['demo_used'] else 'Pendiente de activación',403)
   conf=c.execute('SELECT c.*,n.url,n.alternatives FROM config c JOIN dns n ON n.id=c.dns_id WHERE c.id=1').fetchone();check(conf and conf['enabled'],'Las pruebas están suspendidas',403)
-  return {'status':'demo','expires_at':d['demo_expires'],'server_time':now,'dns':conf['url'],'dns_alternatives':json.loads(conf['alternatives']),'username':conf['service_user'],'password':unseal(conf['service_password']),'channel_policy':{'hidden_ids':[],'hidden_categories':[],'order':[]}}
+  return {'app_theme':app_appearance(c),'status':'demo','expires_at':d['demo_expires'],'server_time':now,'dns':conf['url'],'dns_alternatives':json.loads(conf['alternatives']),'username':conf['service_user'],'password':unseal(conf['service_password']),'channel_policy':{'hidden_ids':[],'hidden_categories':[],'order':[]}}
 @app.get('/api/access')
 def get_access(d=Depends(device)):return access(d)
 @app.post('/api/demo/start')
@@ -278,6 +311,37 @@ def health():return {'status':'ok','application':'oriontv-independent'}
 @app.get('/')
 def index():return FileResponse(Path(__file__).parent/'static/index.html')
 app.mount('/static',StaticFiles(directory=Path(__file__).parent/'static'),name='static')
-# Agente MATEO por WhatsApp
+
+
+
+@app.get('/api/admin/resellers/{name}/dns',dependencies=[Depends(admin)])
+def reseller_dns_permissions(name:str):
+ with db() as c:
+  r=c.execute("SELECT can_add_dns FROM admins WHERE name=? AND role='reseller'",(name,)).fetchone();check(r,'Revendedor no encontrado',404)
+  return {'can_add_dns':bool(r['can_add_dns']),'dns_ids':[x[0] for x in c.execute('SELECT dns_id FROM reseller_dns WHERE reseller=?',(name,))]}
+@app.put('/api/admin/resellers/{name}/dns',dependencies=[Depends(admin)])
+async def set_reseller_dns(name:str,req:Request):
+ b=await req.json();ids=b.get('dns_ids');permission=b.get('can_add_dns')
+ check(isinstance(ids,list) and len(ids)<=500 and all(isinstance(i,str) for i in ids) and len(ids)==len(set(ids)) and isinstance(permission,bool),'Permisos inválidos')
+ with db() as c:
+  check(c.execute("SELECT 1 FROM admins WHERE name=? AND role='reseller'",(name,)).fetchone(),'Revendedor no encontrado',404)
+  for i in ids:
+   r=c.execute('SELECT owner_id FROM dns WHERE id=?',(i,)).fetchone();check(r and r['owner_id'] in (None,name),'DNS no disponible para este revendedor')
+  c.execute('DELETE FROM reseller_dns WHERE reseller=?',(name,))
+  c.executemany('INSERT INTO reseller_dns VALUES (?,?)',[(name,i) for i in ids])
+  c.execute('UPDATE admins SET can_add_dns=? WHERE name=?',(int(permission),name))
+ return {'ok':True}
+@app.get('/permisos-listas',include_in_schema=False)
+def dns_permissions_page(actor=Depends(operator)):
+ return FileResponse(Path(__file__).with_name('permisos_listas.html'))
+
+# OrionTV playlists extension v56
+from playlist_extension import install_playlists
+install_playlists(globals())
+
+from mateo_panel import install_mateo_panel
+install_mateo_panel(globals())
+
+# Agente MATEO por WhatsApp (conservado del repositorio actual)
 from mateo_whatsapp import install as install_mateo_whatsapp
 install_mateo_whatsapp(globals())
