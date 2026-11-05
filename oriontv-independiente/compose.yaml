@@ -20,5 +20,26 @@ services:
     volumes:
       - oriontv_data:/data
 
+  descargas:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    volumes:
+      - /opt/oriontv-downloads:/usr/share/nginx/html/descargas:ro
+    networks:
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.routers.oriontv-descargas.rule=Host(`panel.oriontv.tech`) && PathPrefix(`/descargas/`)"
+      - "traefik.http.routers.oriontv-descargas.entrypoints=websecure"
+      - "traefik.http.routers.oriontv-descargas.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.oriontv-descargas.priority=100"
+      - "traefik.http.routers.oriontv-descargas.service=oriontv-descargas"
+      - "traefik.http.services.oriontv-descargas.loadbalancer.server.port=80"
+
 volumes:
   oriontv_data:
+
+networks:
+  dokploy-network:
+    external: true
