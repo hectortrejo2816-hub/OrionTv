@@ -1,1 +1,12 @@
-{"enabled": false}
+{
+  "enabled": true,
+  "package_name": "com.oriontv.independent",
+  "version_code": 59,
+  "version_name": "2.9.9-orion-management",
+  "min_sdk": 23,
+  "size_bytes": 245262334,
+  "sha256": "906bc2853b50566eb70b8521c998e820f291f21e7b22ea60d71b673739cad404",
+  "signer_sha256": "6b21b1367446136a9c93e2e738521dca2aad0c1bb1d87c84578c46900afbb4c1",
+  "apk_url": "https://panel.oriontv.tech/descargas/OrionTv-Premium-v59.apk",
+  "notes": "Actualización de OrionTV Premium a la versión 59."
+}
